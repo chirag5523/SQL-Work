@@ -1,0 +1,152 @@
+/*
+TITLE: Tobacco Screening and Assessment Audit
+DESCRIPTION: 
+    Extracts inpatient episodes within a specific reporting period and matches 
+    them with tobacco-related assessments (Screening, Smoking Cessation, etc.).
+    The script uses a PIVOT to transform assessment questions into columns.
+*/
+
+-- 1. SET REPORTING PERIOD
+DECLARE @START INT = 20200101; -- YYYYMMDD
+DECLARE @END   INT = 20201231;
+
+DECLARE @START_DATE DATE = CAST(CAST(@START AS CHAR(8)) AS DATE);
+DECLARE @END_DATE   DATE = CAST(CAST(@END AS CHAR(8)) AS DATE);
+
+DECLARE @START_DATE_TIME DATETIME = CAST(CONVERT(CHAR(10), @START_DATE, 112) + ' 00:00:00' AS DATETIME);
+DECLARE @END_DATE_TIME   DATETIME = CAST(CONVERT(CHAR(10), @END_DATE, 112) + ' 23:59:59' AS DATETIME);
+
+WITH INP_EPISODES AS (
+    -- Get Inpatient Episodes within the timeframe for specific CSU codes
+    SELECT   
+        INPATIENT_UNIQUE_ID,
+        PATIENT_KEY,
+        S.SERVICE_SSDESC AS ADMISSION_WARD_NAME,
+        S.SERVICE_LINE_DESC,
+        S.CSU_DESC,
+        CONVERT(DATETIME, CAST(ADMISSION_DATE_KEY AS VARCHAR(10))) + CONVERT(VARCHAR(10), ADMISSION_TIME) AS ADMISSION_DATE_TIME,
+        ISNULL(CONVERT(DATETIME, CAST(DISCHARGE_DATE_KEY AS VARCHAR(10))) + CONVERT(VARCHAR(10), DISCHARGE_TIME), @END_DATE_TIME) AS DISCHARGE_DATE_TIME
+    FROM FACT_INPATIENT_EPISODE I 
+    LEFT JOIN DIM_SERVICE S 
+        ON I.SERVICE_KEY = S.SERVICE_KEY 
+        AND S.RECORD_STATUS = 'A' 
+    WHERE ADMISSION_DATE_KEY BETWEEN @START AND @END 
+      AND S.CSU_CODE IN ('1', '2')
+),
+
+TOBACCO_ASSESSMENT AS (
+    -- Pivot Assessment Questions into structured columns
+    SELECT A.* FROM (
+        SELECT 
+            PATIENT_KEY,
+            CONVERT(DATETIME, CAST(ASSESSMENT_DATE_KEY AS VARCHAR(10))) + CONVERT(VARCHAR(10), ASSESSMENT_TIME) AS TOBACCO_ASSESSMENT_DATE_TIME,
+            ANSWER,
+            CASE
+                WHEN QUESTION = 'AssessmentDate' THEN 'DATE_OF_ASSESSMENT'
+                WHEN QUESTION = 'Does the Client smoke?' THEN 'DOES_CLIENT_SMOKE'
+                WHEN QUESTION = 'How many per day on average?' THEN 'HOW_MANY_PERDAY'
+                WHEN QUESTION = 'Does the Client use E-Cigarettes' THEN 'USE_E_CIGARETTES'
+                WHEN QUESTION = 'Does the Client want to be referred to the tobacco management service?' THEN 'REFERRED_TO_TOBACCO_MGNT'
+                WHEN QUESTION = 'NRT offered?' THEN 'NRToffered'
+                WHEN QUESTION = 'Brief Advice Given?' THEN 'BriefAdviceGiven'
+                WHEN QUESTION = 'leafletoffrd - Offered' THEN 'Smoke_Free_Leaflet_Offered'
+                WHEN QUESTION = 'accepted_699033005 - Accepted' THEN 'Date_Smoke_Free_Leaflet_Accepted'
+                WHEN QUESTION = 'Does the patient require any support to manage tobacco cravings?' THEN 'Patient_required_support_to_manage_tobacco_cravings'
+                WHEN QUESTION = 'Advisor name and user ID' THEN 'Advisor_name_and_ID'
+                WHEN QUESTION = 'AdvisorSText3 - Comment' THEN 'Advisor_Comment_1'
+                WHEN QUESTION = 'AdvisorSText5 - Comment' THEN 'Advisor_Comment_2'
+                WHEN QUESTION = 'Has the client quit at four weeks?' THEN 'Carbon_Monoxide_Reading_PPM'
+                WHEN QUESTION = 'Carbon Monoxide Reading (ppm)' THEN 'Has_the_client_quit_at_four_weeks'
+                WHEN QUESTION = 'Agreed quit date' THEN 'Agreed_quit_date'
+                WHEN QUESTION = 'Quit Tobacco' THEN 'Quit_Tobacco'
+                WHEN QUESTION = 'Type of Intervention' THEN 'Type_of_Intervention'
+                WHEN QUESTION = 'Date of session' THEN 'Date_of_session'
+                WHEN QUESTION = 'Session Type' THEN 'Session_Type'
+                WHEN QUESTION = 'Session Sub-Type' THEN 'Session_Sub_Type'
+                WHEN QUESTION = 'Has the client been referred to a smoking cessation advisor' THEN 'Client_referred_to_smoking_cessation_advisor'
+                WHEN QUESTION = 'Smoking cessation referral outcome' THEN 'Smoking_cessation_referral_outcome'
+            END AS QUESTION_FINAL
+        FROM FACT_ASSESSMENT_DETAIL
+        WHERE ASSESSMENT_DATE_KEY >= @START 
+          AND ASSESSMENT_DATE_KEY < @END  
+          AND ASSESSMENT_NAME IN ('Tobacco Screening', 'Tobacco Management (Smoking Cessation)', 'Smoking Screening', 'Physical Health Assessment/Examination')  
+          AND QUESTION_NO IN (1, 3, 19, 4, 6, 8, 20, 23, 24, 27, 7, 26, 27, 29, 24, 23, 22, 21, 20, 18, 32, 11, 102)
+    ) P
+    PIVOT (
+        MAX(ANSWER)
+        FOR QUESTION_FINAL IN (
+            DATE_OF_ASSESSMENT, DOES_CLIENT_SMOKE, HOW_MANY_PERDAY, USE_E_CIGARETTES, REFERRED_TO_TOBACCO_MGNT, 
+            NRToffered, BriefAdviceGiven, Smoke_Free_Leaflet_Offered, Date_Smoke_Free_Leaflet_Accepted, 
+            Patient_required_support_to_manage_tobacco_cravings, Advisor_name_and_ID, Advisor_Comment_1, 
+            Advisor_Comment_2, Has_the_client_quit_at_four_weeks, Carbon_Monoxide_Reading_PPM, 
+            Agreed_quit_date, Quit_Tobacco, Type_of_Intervention, Date_of_session, Session_Type, 
+            Session_Sub_Type, Client_referred_to_smoking_cessation_advisor, Smoking_cessation_referral_outcome
+        )
+    ) A
+),
+
+TOBACCO_ASSESS_DATA AS (
+    -- Link Inpatient Episodes to the assessments conducted during that stay
+    SELECT 
+        IE.INPATIENT_UNIQUE_ID,
+        IE.ADMISSION_DATE_TIME,
+        IE.PATIENT_KEY AS INP_PATIENT_KEY,
+        IE.CSU_DESC,
+        IE.SERVICE_LINE_DESC,
+        IE.ADMISSION_WARD_NAME, 
+        PAT.CLIENTID, 
+        TA.*, 
+        SER.SERVICE_SSDESC AS TOBACCO_ASSESSMENT_WARD_NAME,
+        ROW_NUMBER() OVER (PARTITION BY IE.INPATIENT_UNIQUE_ID ORDER BY TA.TOBACCO_ASSESSMENT_DATE_TIME DESC) AS SEQ_NO
+    FROM INP_EPISODES IE
+    LEFT JOIN TOBACCO_ASSESSMENT TA 
+        ON IE.PATIENT_KEY = TA.PATIENT_KEY 
+        AND TA.TOBACCO_ASSESSMENT_DATE_TIME BETWEEN IE.ADMISSION_DATE_TIME AND IE.DISCHARGE_DATE_TIME
+    LEFT JOIN DIM_PATIENT PAT 
+        ON IE.PATIENT_KEY = PAT.PATIENT_KEY 
+        AND PAT.RECORD_STATUS = 'A'
+    LEFT JOIN FACT_WARDSTAY WS 
+        ON WS.PATIENT_KEY = TA.PATIENT_KEY 
+        AND TA.TOBACCO_ASSESSMENT_DATE_TIME >= CONVERT(DATETIME, CAST(WS.START_DATE_KEY AS VARCHAR(10))) + CONVERT(VARCHAR(10), WS.START_TIME)
+        AND TA.TOBACCO_ASSESSMENT_DATE_TIME <  ISNULL(CONVERT(DATETIME, CAST(WS.END_DATE_KEY AS VARCHAR(10))) + CONVERT(VARCHAR(10), WS.END_TIME), @END_DATE_TIME) 
+    LEFT JOIN DIM_SERVICE SER 
+        ON SER.SERVICE_KEY = WS.SERVICE_KEY 
+        AND SER.RECORD_STATUS = 'A' 
+)
+
+-- FINAL OUTPUT: Get the most recent assessment per inpatient spell
+SELECT   
+    FT.INP_PATIENT_KEY,
+    FT.CLIENTID,
+    FT.CSU_Desc,
+    FT.SERVICE_LINE_DESC,
+    FT.ADMISSION_WARD_NAME,
+    FT.ADMISSION_DATE_TIME,
+    FT.TOBACCO_ASSESSMENT_DATE_TIME,
+    FT.TOBACCO_ASSESSMENT_WARD_NAME,
+    FT.DATE_OF_ASSESSMENT,
+    FT.DOES_CLIENT_SMOKE,
+    FT.HOW_MANY_PERDAY,
+    FT.USE_E_CIGARETTES,
+    FT.REFERRED_TO_TOBACCO_MGNT,
+    FT.NRToffered,
+    FT.BriefAdviceGiven,
+    FT.Smoke_Free_Leaflet_Offered,
+    FT.Date_Smoke_Free_Leaflet_Accepted,
+    FT.Patient_required_support_to_manage_tobacco_cravings,
+    FT.Advisor_name_and_ID,
+    FT.Advisor_Comment_1,
+    FT.Advisor_Comment_2,
+    FT.Has_the_client_quit_at_four_weeks,
+    FT.Carbon_Monoxide_Reading_PPM,
+    FT.Agreed_quit_date,
+    FT.Quit_Tobacco,
+    FT.Type_of_Intervention,
+    FT.Date_of_session,
+    FT.Session_Type,
+    FT.Session_Sub_Type,
+    FT.Client_referred_to_smoking_cessation_advisor,
+    FT.Smoking_cessation_referral_outcome
+FROM TOBACCO_ASSESS_DATA FT
+WHERE SEQ_NO = 1
+ORDER BY FT.ADMISSION_DATE_TIME;
