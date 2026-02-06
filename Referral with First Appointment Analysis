@@ -1,0 +1,69 @@
+/*
+TITLE: Referral with First Appointment Analysis
+DESCRIPTION: 
+    Calculates wait times between referral and the first attended appointment 
+    for patients referred with 'Anxiety'.
+    Includes:
+    - Age at time of referral.
+    - Service and referral source details.
+    - Calculation of days between referral and the first FTF, TC, or TM appointment.
+*/
+
+SELECT 
+    A.[SS_CODE],
+    A.[PATIENT_KEY],
+    B.CLIENTID,
+    B.AGE,
+    DATEDIFF(DD, B.DATE_OF_BIRTH, (CONVERT(DATE, CONVERT(CHAR(8), REFERRAL_DATE_KEY), 103))) / 365.25 AS AGE_ON_REF,
+    A.[REFERRAL_ID],
+    A.[REFERRAL_UNIQUE_ID],
+    [REFERRED_TO_SERVICE_KEY],
+    C.SERVICE_SSDESC,
+    C.SERVICE_LINE_DESC,
+    [REFERRAL_SOURCE_DESC],
+    [REFERRAL_REASON_DESC],
+    CONVERT(DATE, CONVERT(CHAR(8), REFERRAL_DATE_KEY), 103)  AS REFERRAL_DATE,
+    CONVERT(DATE, CONVERT(CHAR(8), DISCHARGE_DATE_KEY), 103) AS DISCHARGE_DATE,
+    CONVERT(DATE, CONVERT(CHAR(8), REJECTION_DATE_KEY), 103) AS REJECTION_DATE,
+    CONVERT(DATE, CONVERT(CHAR(8), F.APPOINTMENT_DATE_KEY), 103) AS FIRST_APPOINTMENT_DATE,
+    DATEDIFF(DD, 
+        (CONVERT(DATE, CONVERT(CHAR(8), REFERRAL_DATE_KEY), 103)), 
+        (CONVERT(DATE, CONVERT(CHAR(8), F.APPOINTMENT_DATE_KEY), 103))
+    ) AS DAYS_BETWEEN_REF_AND_APP
+      
+FROM FACT_REFERRAL A
+LEFT JOIN DIM_PATIENT B 
+    ON A.PATIENT_KEY = B.PATIENT_KEY 
+    AND A.SS_CODE = B.SS_CODE 
+    AND B.RECORD_STATUS = 'A'
+LEFT JOIN DIM_SERVICE C 
+    ON A.REFERRED_TO_SERVICE_KEY = C.SERVICE_KEY 
+    AND A.SS_CODE = C.SS_CODE 
+    AND C.RECORD_STATUS = 'A'
+
+-- Identifying the first valid appointment after referral
+OUTER APPLY (
+    SELECT TOP 1 * FROM FACT_APPOINTMENT APP
+    WHERE A.REFERRAL_UNIQUE_ID = APP.REFERRAL_UNIQUE_ID 
+      AND A.PATIENT_KEY = APP.PATIENT_KEY 
+      AND A.SS_CODE = APP.SS_CODE
+      AND APP.CAL_OUTCOME_DESC IN ('FTF', 'TC', 'TM') -- Face to Face, Telephone, or Telemedicine
+      AND APP.APPOINTMENT_DATE_KEY >= A.REFERRAL_DATE_KEY
+      AND APP.APPOINTMENT_DATE_KEY > 20190101
+    ORDER BY APPOINTMENT_DATE_KEY ASC
+) F
+
+WHERE A.REFERRAL_REASON_DESC = 'Anxiety'
+  AND C.SERVICE_LINE_DESC IN (
+        'Acute mental health services',
+        'CAMHS and developmental services',
+        'Community and recovery mental health services',
+        'Older People''s Mental Health Service (OPMHS)',
+        'Psychological medicine services'
+      )
+  AND B.DELETED_FLAG = 0
+  AND B.TEST_PATIENT_FLAG = 0
+  AND B.PATIENT_FLAG = 1
+  AND B.LOGIC_DELETE = 'No'
+
+ORDER BY A.PATIENT_KEY, A.REFERRAL_DATE_KEY;
